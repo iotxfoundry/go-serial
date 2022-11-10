@@ -18,7 +18,6 @@ package serial
 */
 
 import (
-	"fmt"
 	"os"
 	"sync"
 	"syscall"
@@ -110,11 +109,9 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
-		fmt.Println("readTimeoutCycles", port.readTimeoutCycles, cycles)
 		if port.readTimeoutCycles != -1 {
 			cycles++
 			if cycles == port.readTimeoutCycles {
-				fmt.Println("timeout")
 				// Timeout
 				return 0, os.ErrDeadlineExceeded
 			}
