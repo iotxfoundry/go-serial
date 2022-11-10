@@ -18,15 +18,18 @@ package serial
 */
 
 import (
+	"fmt"
+	"os"
 	"sync"
 	"syscall"
 	"time"
 )
 
 type windowsPort struct {
-	mu                sync.Mutex
-	handle            syscall.Handle
-	readTimeoutCycles int64
+	mu                 sync.Mutex
+	handle             syscall.Handle
+	readTimeoutCycles  int64
+	writeTimeoutCycles int64
 }
 
 func nativeGetPortsList() ([]string, error) {
@@ -107,11 +110,13 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
+		fmt.Println("readTimeoutCycles", port.readTimeoutCycles, cycles)
 		if port.readTimeoutCycles != -1 {
 			cycles++
 			if cycles == port.readTimeoutCycles {
+				fmt.Println("timeout")
 				// Timeout
-				return 0, nil
+				return 0, os.ErrDeadlineExceeded
 			}
 		}
 
@@ -135,10 +140,49 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	defer syscall.CloseHandle(ev.HEvent)
-	err = syscall.WriteFile(port.handle, p, &writed, ev)
-	if err == syscall.ERROR_IO_PENDING {
-		// wait for write to complete
-		err = getOverlappedResult(port.handle, ev, &writed, true)
+	cycles := int64(0)
+	for {
+		err = syscall.WriteFile(port.handle, p, &writed, ev)
+		if err == syscall.ERROR_IO_PENDING {
+			// wait for write to complete
+			err = getOverlappedResult(port.handle, ev, &writed, true)
+		}
+		switch err {
+		case nil:
+			// operation completed successfully
+		case syscall.ERROR_OPERATION_ABORTED:
+			// port may have been closed
+			return int(writed), &PortError{code: PortClosed, causedBy: err}
+		default:
+			// error happened
+			return int(writed), err
+		}
+
+		if writed > 0 {
+			return int(writed), nil
+		}
+		if err := resetEvent(ev.HEvent); err != nil {
+			return 0, err
+		}
+
+		if port.writeTimeoutCycles != -1 {
+			cycles++
+			if cycles == port.writeTimeoutCycles {
+				// Timeout
+				return 0, nil
+			}
+		}
+
+		// At the moment it seems that the only reliable way to check if
+		// a serial port is alive in Windows is to check if the SetCommState
+		// function fails.
+
+		params := &dcb{}
+		getCommState(port.handle, params)
+		if err := setCommState(port.handle, params); err != nil {
+			port.Close()
+			return 0, err
+		}
 	}
 	return int(writed), err
 }
@@ -270,9 +314,9 @@ const (
 
 func (port *windowsPort) SetMode(mode *Mode) error {
 	params := dcb{}
-	if getCommState(port.handle, &params) != nil {
+	if err := getCommState(port.handle, &params); err != nil {
 		port.Close()
-		return &PortError{code: InvalidSerialPort}
+		return &PortError{code: InvalidSerialPort, causedBy: err}
 	}
 	if mode.BaudRate == 0 {
 		params.BaudRate = 9600 // Default to 9600
@@ -286,9 +330,9 @@ func (port *windowsPort) SetMode(mode *Mode) error {
 	}
 	params.StopBits = stopBitsMap[mode.StopBits]
 	params.Parity = parityMap[mode.Parity]
-	if setCommState(port.handle, &params) != nil {
+	if err := setCommState(port.handle, &params); err != nil {
 		port.Close()
-		return &PortError{code: InvalidSerialPort}
+		return &PortError{code: InvalidSerialPort, causedBy: err}
 	}
 	return nil
 }
@@ -392,17 +436,49 @@ func (port *windowsPort) SetReadTimeout(timeout time.Duration) error {
 		cycleDuration = timeout.Milliseconds() / cycles
 	}
 
-	err := setCommTimeouts(port.handle, &commTimeouts{
-		ReadIntervalTimeout:         0xFFFFFFFF,
-		ReadTotalTimeoutMultiplier:  0xFFFFFFFF,
-		ReadTotalTimeoutConstant:    uint32(cycleDuration),
-		WriteTotalTimeoutConstant:   0,
-		WriteTotalTimeoutMultiplier: 0,
-	})
+	params := &commTimeouts{}
+	err := getCommTimeouts(port.handle, params)
+	if err != nil {
+		return &PortError{causedBy: err}
+	}
+
+	params.ReadIntervalTimeout = 0
+	params.ReadTotalTimeoutMultiplier = 0
+	params.ReadTotalTimeoutConstant = uint32(cycleDuration)
+
+	err = setCommTimeouts(port.handle, params)
 	if err != nil {
 		return &PortError{code: InvalidTimeoutValue, causedBy: err}
 	}
 	port.readTimeoutCycles = cycles
+
+	return nil
+}
+
+func (port *windowsPort) SetWriteTimeout(timeout time.Duration) error {
+	var cycles, cycleDuration int64
+	if timeout == NoTimeout {
+		cycles = -1
+		cycleDuration = 1000
+	} else {
+		cycles = timeout.Milliseconds()/1000 + 1
+		cycleDuration = timeout.Milliseconds() / cycles
+	}
+
+	params := &commTimeouts{}
+	err := getCommTimeouts(port.handle, params)
+	if err != nil {
+		return &PortError{causedBy: err}
+	}
+
+	params.WriteTotalTimeoutConstant = uint32(cycleDuration)
+	params.WriteTotalTimeoutMultiplier = 0
+
+	err = setCommTimeouts(port.handle, params)
+	if err != nil {
+		return &PortError{code: InvalidTimeoutValue, causedBy: err}
+	}
+	port.writeTimeoutCycles = cycles
 
 	return nil
 }
@@ -430,7 +506,7 @@ func nativeOpen(portName string, mode *Mode) (*windowsPort, error) {
 		case syscall.ERROR_ACCESS_DENIED:
 			return nil, &PortError{code: PortBusy}
 		case syscall.ERROR_FILE_NOT_FOUND:
-			return nil, &PortError{code: PortNotFound}
+			return nil, &PortError{code: PortNotFound, causedBy: err}
 		}
 		return nil, err
 	}
@@ -440,15 +516,15 @@ func nativeOpen(portName string, mode *Mode) (*windowsPort, error) {
 	}
 
 	// Set port parameters
-	if port.SetMode(mode) != nil {
+	if err = port.SetMode(mode); err != nil {
 		port.Close()
-		return nil, &PortError{code: InvalidSerialPort}
+		return nil, &PortError{code: InvalidSerialPort, causedBy: err}
 	}
 
 	params := &dcb{}
-	if getCommState(port.handle, params) != nil {
+	if err = getCommState(port.handle, params); err != nil {
 		port.Close()
-		return nil, &PortError{code: InvalidSerialPort}
+		return nil, &PortError{code: InvalidSerialPort, causedBy: err}
 	}
 	params.Flags &= dcbDTRControlDisableMask
 	params.Flags &= dcbRTSControlDisbaleMask
@@ -476,14 +552,19 @@ func nativeOpen(portName string, mode *Mode) (*windowsPort, error) {
 	params.XoffLim = 512
 	params.XonChar = 17  // DC1
 	params.XoffChar = 19 // C3
-	if setCommState(port.handle, params) != nil {
+	if err = setCommState(port.handle, params); err != nil {
 		port.Close()
-		return nil, &PortError{code: InvalidSerialPort}
+		return nil, &PortError{code: InvalidSerialPort, causedBy: err}
 	}
 
-	if port.SetReadTimeout(NoTimeout) != nil {
+	if err = port.SetReadTimeout(NoTimeout); err != nil {
 		port.Close()
-		return nil, &PortError{code: InvalidSerialPort}
+		return nil, &PortError{code: InvalidSerialPort, causedBy: err}
+	}
+
+	if err = port.SetWriteTimeout(NoTimeout); err != nil {
+		port.Close()
+		return nil, &PortError{code: InvalidSerialPort, causedBy: err}
 	}
 	return port, nil
 }

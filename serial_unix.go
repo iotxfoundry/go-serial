@@ -4,12 +4,13 @@
 // license that can be found in the LICENSE file.
 //
 
+//go:build linux || darwin || freebsd || openbsd
 // +build linux darwin freebsd openbsd
 
 package serial
 
 import (
-	"io/ioutil"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -23,10 +24,11 @@ import (
 type unixPort struct {
 	handle int
 
-	readTimeout time.Duration
-	closeLock   sync.RWMutex
-	closeSignal *unixutils.Pipe
-	opened      uint32
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	closeLock    sync.RWMutex
+	closeSignal  *unixutils.Pipe
+	opened       uint32
 }
 
 func (port *unixPort) Close() error {
@@ -110,11 +112,50 @@ func (port *unixPort) Read(p []byte) (int, error) {
 }
 
 func (port *unixPort) Write(p []byte) (n int, err error) {
-	n, err = unix.Write(port.handle, p)
-	if n < 0 { // Do not return -1 unix errors
-		n = 0
+	var deadline time.Time
+	if port.writeTimeout != NoTimeout {
+		deadline = time.Now().Add(port.writeTimeout)
 	}
-	return
+
+	fds := unixutils.NewFDSet(port.handle, port.closeSignal.WriteFD())
+	for {
+		timeout := time.Duration(-1)
+		if port.writeTimeout != NoTimeout {
+			timeout = time.Until(deadline)
+			if timeout < 0 {
+				// a negative timeout means "no-timeout" in Select(...)
+				timeout = 0
+			}
+		}
+		res, err := unixutils.Select(fds, nil, fds, timeout)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if res.IsWritable(port.closeSignal.WriteFD()) {
+			return 0, &PortError{code: PortClosed}
+		}
+		if !res.IsWritable(port.handle) {
+			// Timeout happened
+			return 0, nil
+		}
+		n, err = unix.Write(port.handle, p)
+		if err == unix.EINTR {
+			continue
+		}
+		// Linux: when the port is disconnected during a read operation
+		// the port is left in a "readable with zero-length-data" state.
+		// https://stackoverflow.com/a/34945814/1655275
+		if n == 0 && err == nil {
+			return 0, &PortError{code: PortClosed}
+		}
+		if n < 0 { // Do not return -1 unix errors
+			n = 0
+		}
+		return n, err
+	}
 }
 
 func (port *unixPort) ResetInputBuffer() error {
@@ -192,6 +233,14 @@ func (port *unixPort) SetReadTimeout(timeout time.Duration) error {
 	return nil
 }
 
+func (port *unixPort) SetWriteTimeout(timeout time.Duration) error {
+	if timeout < 0 && timeout != NoTimeout {
+		return &PortError{code: InvalidTimeoutValue}
+	}
+	port.writeTimeout = timeout
+	return nil
+}
+
 func (port *unixPort) GetModemStatusBits() (*ModemStatusBits, error) {
 	status, err := port.getModemBitsStatus()
 	if err != nil {
@@ -217,9 +266,10 @@ func nativeOpen(portName string, mode *Mode) (*unixPort, error) {
 		return nil, err
 	}
 	port := &unixPort{
-		handle:      h,
-		opened:      1,
-		readTimeout: NoTimeout,
+		handle:       h,
+		opened:       1,
+		readTimeout:  NoTimeout,
+		writeTimeout: NoTimeout,
 	}
 
 	// Setup serial port
@@ -283,7 +333,7 @@ func nativeOpen(portName string, mode *Mode) (*unixPort, error) {
 }
 
 func nativeGetPortsList() ([]string, error) {
-	files, err := ioutil.ReadDir(devFolder)
+	files, err := os.ReadDir(devFolder)
 	if err != nil {
 		return nil, err
 	}

@@ -46,11 +46,15 @@ type Port interface {
 	// to disable read timeout.
 	SetReadTimeout(t time.Duration) error
 
+	// SetWriteTimeout sets the timeout for the Write operation or use serial.NoTimeout
+	// to disable write timeout.
+	SetWriteTimeout(timeout time.Duration) error
+
 	// Close the serial port
 	Close() error
 }
 
-// NoTimeout should be used as a parameter to SetReadTimeout to disable timeout.
+// NoTimeout should be used as a parameter to SetReadTimeout or SetWriteTimeout to disable timeout.
 var NoTimeout time.Duration = -1
 
 // ModemStatusBits contains all the modem input status bits for a serial port (CTS, DSR, etc...).

@@ -12,6 +12,8 @@ package serial
 
 //sys setCommState(handle syscall.Handle, dcb *dcb) (err error) = SetCommState
 
+//sys getCommTimeouts(handle syscall.Handle, timeouts *commTimeouts) (err error) = GetCommTimeouts
+
 //sys setCommTimeouts(handle syscall.Handle, timeouts *commTimeouts) (err error) = SetCommTimeouts
 
 //sys escapeCommFunction(handle syscall.Handle, function uint32) (res bool) = EscapeCommFunction
