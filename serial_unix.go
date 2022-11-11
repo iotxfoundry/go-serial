@@ -92,7 +92,7 @@ func (port *unixPort) Read(p []byte) (int, error) {
 		}
 		if !res.IsReadable(port.handle) {
 			// Timeout happened
-			return 0, nil
+			return 0, os.ErrDeadlineExceeded
 		}
 		n, err := unix.Read(port.handle, p)
 		if err == unix.EINTR {
@@ -127,19 +127,19 @@ func (port *unixPort) Write(p []byte) (n int, err error) {
 				timeout = 0
 			}
 		}
-		res, err := unixutils.Select(fds, nil, fds, timeout)
+		res, err := unixutils.Select(nil, fds, fds, timeout)
 		if err == unix.EINTR {
 			continue
 		}
 		if err != nil {
 			return 0, err
 		}
-		if res.IsWritable(port.closeSignal.WriteFD()) {
+		if !res.IsWritable(port.closeSignal.WriteFD()) {
 			return 0, &PortError{code: PortClosed}
 		}
 		if !res.IsWritable(port.handle) {
 			// Timeout happened
-			return 0, nil
+			return 0, os.ErrDeadlineExceeded
 		}
 		n, err = unix.Write(port.handle, p)
 		if err == unix.EINTR {
