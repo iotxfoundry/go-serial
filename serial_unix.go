@@ -158,12 +158,18 @@ func (port *unixPort) Write(p []byte) (n int, err error) {
 	}
 }
 
-func (port *unixPort) ResetInputBuffer() error {
-	return unix.IoctlSetInt(port.handle, ioctlTcflsh, unix.TCIFLUSH)
-}
+func (port *unixPort) Break(t time.Duration) error {
+	if err := unix.IoctlSetInt(port.handle, ioctlTiocsbrk, 0); err != nil {
+		return err
+	}
 
-func (port *unixPort) ResetOutputBuffer() error {
-	return unix.IoctlSetInt(port.handle, ioctlTcflsh, unix.TCOFLUSH)
+	time.Sleep(t)
+
+	if err := unix.IoctlSetInt(port.handle, ioctlTioccbrk, 0); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (port *unixPort) SetMode(mode *Mode) error {

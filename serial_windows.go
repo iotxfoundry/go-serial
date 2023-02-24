@@ -25,10 +25,8 @@ import (
 )
 
 type windowsPort struct {
-	mu                 sync.Mutex
-	handle             syscall.Handle
-	readTimeoutCycles  int64
-	writeTimeoutCycles int64
+	mu     sync.Mutex
+	handle syscall.Handle
 }
 
 func nativeGetPortsList() ([]string, error) {
@@ -85,49 +83,26 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 	}
 	defer syscall.CloseHandle(ev.HEvent)
 
-	cycles := int64(0)
-	for {
-		err := syscall.ReadFile(port.handle, p, &readed, ev)
-		if err == syscall.ERROR_IO_PENDING {
-			err = getOverlappedResult(port.handle, ev, &readed, true)
-		}
-		switch err {
-		case nil:
-			// operation completed successfully
-		case syscall.ERROR_OPERATION_ABORTED:
-			// port may have been closed
-			return int(readed), &PortError{code: PortClosed, causedBy: err}
-		default:
-			// error happened
-			return int(readed), err
-		}
-
-		if readed > 0 {
-			return int(readed), nil
-		}
-		if err := resetEvent(ev.HEvent); err != nil {
-			return 0, err
-		}
-
-		if port.readTimeoutCycles != -1 {
-			cycles++
-			if cycles == port.readTimeoutCycles {
-				// Timeout
-				return 0, os.ErrDeadlineExceeded
-			}
-		}
-
-		// At the moment it seems that the only reliable way to check if
-		// a serial port is alive in Windows is to check if the SetCommState
-		// function fails.
-
-		params := &dcb{}
-		getCommState(port.handle, params)
-		if err := setCommState(port.handle, params); err != nil {
-			port.Close()
-			return 0, err
-		}
+	err = syscall.ReadFile(port.handle, p, &readed, ev)
+	if err == syscall.ERROR_IO_PENDING {
+		err = getOverlappedResult(port.handle, ev, &readed, true)
 	}
+	switch err {
+	case nil:
+		// operation completed successfully
+	case syscall.ERROR_OPERATION_ABORTED:
+		// port may have been closed
+		return int(readed), &PortError{code: PortClosed, causedBy: err}
+	default:
+		// error happened
+		return int(readed), err
+	}
+	if readed > 0 {
+		return int(readed), nil
+	}
+
+	// Timeout
+	return 0, ErrDeadlineExceeded
 }
 
 func (port *windowsPort) Write(p []byte) (int, error) {
@@ -137,49 +112,10 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	defer syscall.CloseHandle(ev.HEvent)
-	cycles := int64(0)
-	for {
-		err = syscall.WriteFile(port.handle, p, &writed, ev)
-		if err == syscall.ERROR_IO_PENDING {
-			// wait for write to complete
-			err = getOverlappedResult(port.handle, ev, &writed, true)
-		}
-		switch err {
-		case nil:
-			// operation completed successfully
-		case syscall.ERROR_OPERATION_ABORTED:
-			// port may have been closed
-			return int(writed), &PortError{code: PortClosed, causedBy: err}
-		default:
-			// error happened
-			return int(writed), err
-		}
-
-		if writed > 0 {
-			return int(writed), nil
-		}
-		if err := resetEvent(ev.HEvent); err != nil {
-			return 0, err
-		}
-
-		if port.writeTimeoutCycles != -1 {
-			cycles++
-			if cycles == port.writeTimeoutCycles {
-				// Timeout
-				return 0, nil
-			}
-		}
-
-		// At the moment it seems that the only reliable way to check if
-		// a serial port is alive in Windows is to check if the SetCommState
-		// function fails.
-
-		params := &dcb{}
-		getCommState(port.handle, params)
-		if err := setCommState(port.handle, params); err != nil {
-			port.Close()
-			return 0, err
-		}
+	err = syscall.WriteFile(port.handle, p, &writed, ev)
+	if err == syscall.ERROR_IO_PENDING {
+		// wait for write to complete
+		err = getOverlappedResult(port.handle, ev, &writed, true)
 	}
 	return int(writed), err
 }
@@ -424,58 +360,69 @@ func (port *windowsPort) GetModemStatusBits() (*ModemStatusBits, error) {
 }
 
 func (port *windowsPort) SetReadTimeout(timeout time.Duration) error {
-	var cycles, cycleDuration int64
-	if timeout == NoTimeout {
-		cycles = -1
-		cycleDuration = 1000
-	} else {
-		cycles = timeout.Milliseconds()/1000 + 1
-		cycleDuration = timeout.Milliseconds() / cycles
+	commTimeouts := &commTimeouts{
+		ReadIntervalTimeout:         0xFFFFFFFF,
+		ReadTotalTimeoutMultiplier:  0xFFFFFFFF,
+		ReadTotalTimeoutConstant:    0xFFFFFFFE,
+		WriteTotalTimeoutConstant:   0,
+		WriteTotalTimeoutMultiplier: 0,
 	}
-
-	params := &commTimeouts{}
-	err := getCommTimeouts(port.handle, params)
-	if err != nil {
+	if err := getCommTimeouts(port.handle, commTimeouts); err != nil {
 		return &PortError{causedBy: err}
 	}
+	if timeout != NoTimeout {
+		ms := timeout.Milliseconds()
+		if ms > 0xFFFFFFFE || ms < 0 {
+			return &PortError{code: InvalidTimeoutValue}
+		}
+		commTimeouts.ReadTotalTimeoutConstant = uint32(ms)
+	}
 
-	params.ReadIntervalTimeout = 0
-	params.ReadTotalTimeoutMultiplier = 0
-	params.ReadTotalTimeoutConstant = uint32(cycleDuration)
-
-	err = setCommTimeouts(port.handle, params)
-	if err != nil {
+	if err := setCommTimeouts(port.handle, commTimeouts); err != nil {
 		return &PortError{code: InvalidTimeoutValue, causedBy: err}
 	}
-	port.readTimeoutCycles = cycles
 
 	return nil
 }
 
 func (port *windowsPort) SetWriteTimeout(timeout time.Duration) error {
-	var cycles, cycleDuration int64
-	if timeout == NoTimeout {
-		cycles = -1
-		cycleDuration = 1000
-	} else {
-		cycles = timeout.Milliseconds()/1000 + 1
-		cycleDuration = timeout.Milliseconds() / cycles
+	commTimeouts := &commTimeouts{
+		ReadIntervalTimeout:         0xFFFFFFFF,
+		ReadTotalTimeoutMultiplier:  0xFFFFFFFF,
+		ReadTotalTimeoutConstant:    0xFFFFFFFE,
+		WriteTotalTimeoutConstant:   0,
+		WriteTotalTimeoutMultiplier: 0,
+	}
+	if err := getCommTimeouts(port.handle, commTimeouts); err != nil {
+		return &PortError{causedBy: err}
+	}
+	
+	if timeout != NoTimeout {
+		ms := timeout.Milliseconds()
+		if ms > 0xFFFFFFFE || ms < 0 {
+			return &PortError{code: InvalidTimeoutValue}
+		}
+		commTimeouts.ReadTotalTimeoutConstant = uint32(ms)
+		commTimeouts.WriteTotalTimeoutMultiplier = 0
 	}
 
-	params := &commTimeouts{}
-	err := getCommTimeouts(port.handle, params)
-	if err != nil {
+	if err := setCommTimeouts(port.handle, commTimeouts); err != nil {
+		return &PortError{code: InvalidTimeoutValue, causedBy: err}
+	}
+
+	return nil
+}
+
+func (port *windowsPort) Break(d time.Duration) error {
+	if err := setCommBreak(port.handle); err != nil {
 		return &PortError{causedBy: err}
 	}
 
-	params.WriteTotalTimeoutConstant = uint32(cycleDuration)
-	params.WriteTotalTimeoutMultiplier = 0
+	time.Sleep(d)
 
-	err = setCommTimeouts(port.handle, params)
-	if err != nil {
-		return &PortError{code: InvalidTimeoutValue, causedBy: err}
+	if err := clearCommBreak(port.handle); err != nil {
+		return &PortError{causedBy: err}
 	}
-	port.writeTimeoutCycles = cycles
 
 	return nil
 }
