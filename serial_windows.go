@@ -102,7 +102,7 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 	}
 
 	// Timeout
-	return 0, ErrDeadlineExceeded
+	return 0, os.ErrDeadlineExceeded
 }
 
 func (port *windowsPort) Write(p []byte) (int, error) {
@@ -396,7 +396,7 @@ func (port *windowsPort) SetWriteTimeout(timeout time.Duration) error {
 	if err := getCommTimeouts(port.handle, commTimeouts); err != nil {
 		return &PortError{causedBy: err}
 	}
-	
+
 	if timeout != NoTimeout {
 		ms := timeout.Milliseconds()
 		if ms > 0xFFFFFFFE || ms < 0 {

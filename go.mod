@@ -3,9 +3,8 @@ module go.bug.st/serial
 go 1.19
 
 require (
-	github.com/creack/goselect v0.1.2
 	github.com/stretchr/testify v1.8.1
-	golang.org/x/sys v0.2.0
+	golang.org/x/sys v0.5.0
 )
 
 require (
