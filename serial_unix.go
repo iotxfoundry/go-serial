@@ -1,11 +1,10 @@
 //
-// Copyright 2014-2021 Cristian Maglie. All rights reserved.
+// Copyright 2014-2023 Cristian Maglie. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 //
 
 //go:build linux || darwin || freebsd || openbsd
-// +build linux darwin freebsd openbsd
 
 package serial
 
@@ -362,8 +361,8 @@ func nativeGetPortsList() ([]string, error) {
 
 		portName := devFolder + "/" + f.Name()
 
-		// Check if serial port is real or is a placeholder serial port "ttySxx"
-		if strings.HasPrefix(f.Name(), "ttyS") {
+		// Check if serial port is real or is a placeholder serial port "ttySxx" or "ttyHSxx"
+		if strings.HasPrefix(f.Name(), "ttyS") || strings.HasPrefix(f.Name(), "ttyHS") {
 			port, err := nativeOpen(portName, &Mode{})
 			if err != nil {
 				continue

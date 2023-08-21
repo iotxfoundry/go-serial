@@ -1,5 +1,5 @@
 //
-// Copyright 2014-2021 Cristian Maglie. All rights reserved.
+// Copyright 2014-2023 Cristian Maglie. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 //
@@ -118,6 +118,10 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 		err = getOverlappedResult(port.handle, ev, &writed, true)
 	}
 	return int(writed), err
+}
+
+func (port *windowsPort) Drain() (err error) {
+	return syscall.FlushFileBuffers(port.handle)
 }
 
 const (

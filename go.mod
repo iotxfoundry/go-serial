@@ -3,8 +3,8 @@ module go.bug.st/serial
 go 1.20
 
 require (
-	github.com/stretchr/testify v1.8.1
-	golang.org/x/sys v0.5.0
+	github.com/stretchr/testify v1.8.4
+	golang.org/x/sys v0.11.0
 )
 
 require (
