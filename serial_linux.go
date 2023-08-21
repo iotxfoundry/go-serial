@@ -9,6 +9,8 @@ package serial
 import "golang.org/x/sys/unix"
 
 const devFolder = "/dev"
+
+// const regexFilter = "(ttyS|ttyHS|ttyUSB|ttyACM|ttyAMA|rfcomm|ttyO|ttymxc)[0-9]{1,3}"
 const regexFilter = "(ttyS|ttyHS|ttyUSB|ttyXRUSB|ttyACM|ttyAMA|rfcomm|ttyO|ttymxc)[0-9]{1,3}"
 
 // termios manipulation functions
