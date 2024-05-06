@@ -1,5 +1,5 @@
 //
-// Copyright 2014-2023 Cristian Maglie. All rights reserved.
+// Copyright 2014-2024 Cristian Maglie. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 //
@@ -255,6 +255,15 @@ func (port *windowsPort) SetMode(mode *Mode) error {
 		port.Close()
 		return &PortError{code: InvalidSerialPort, causedBy: err}
 	}
+	port.setModeParams(mode, &params)
+	if setCommState(port.handle, &params) != nil {
+		port.Close()
+		return &PortError{code: InvalidSerialPort}
+	}
+	return nil
+}
+
+func (port *windowsPort) setModeParams(mode *Mode, params *dcb) {
 	if mode.BaudRate == 0 {
 		params.BaudRate = 9600 // Default to 9600
 	} else {
@@ -267,11 +276,6 @@ func (port *windowsPort) SetMode(mode *Mode) error {
 	}
 	params.StopBits = stopBitsMap[mode.StopBits]
 	params.Parity = parityMap[mode.Parity]
-	if err := setCommState(port.handle, &params); err != nil {
-		port.Close()
-		return &PortError{code: InvalidSerialPort, causedBy: err}
-	}
-	return nil
 }
 
 func (port *windowsPort) SetDTR(dtr bool) error {
@@ -464,16 +468,12 @@ func nativeOpen(portName string, mode *Mode) (*windowsPort, error) {
 	}
 
 	// Set port parameters
-	if err = port.SetMode(mode); err != nil {
-		port.Close()
-		return nil, &PortError{code: InvalidSerialPort, causedBy: err}
-	}
-
 	params := &dcb{}
 	if err = getCommState(port.handle, params); err != nil {
 		port.Close()
 		return nil, &PortError{code: InvalidSerialPort, causedBy: err}
 	}
+	port.setModeParams(mode, params)
 	params.Flags &= dcbDTRControlDisableMask
 	params.Flags &= dcbRTSControlDisbaleMask
 	if mode.InitialStatusBits == nil {
