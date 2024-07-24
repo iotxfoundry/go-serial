@@ -8,8 +8,6 @@ package serial
 
 import "time"
 
-//go:generate go run golang.org/x/sys/windows/mkwinsyscall -output zsyscall_windows.go syscall_windows.go
-
 // Port is the interface for a serial Port
 type Port interface {
 	// SetMode sets all parameters of the serial port
@@ -151,7 +149,7 @@ const (
 	PortNotFound
 	// InvalidSerialPort the requested port is not a serial port
 	InvalidSerialPort
-	// PermissionDenied the user doesn't have enough priviledges
+	// PermissionDenied the user doesn't have enough privileges
 	PermissionDenied
 	// InvalidSpeed the requested speed is not valid or not supported
 	InvalidSpeed
