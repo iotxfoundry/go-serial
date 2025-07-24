@@ -41,11 +41,11 @@ func nativeGetPortDetails(portPath string) (*PortDetails, error) {
 	}
 	realDevicePath, err := filepath.EvalSymlinks(devicePath)
 	if err != nil {
-		return nil, fmt.Errorf("Can't determine real path of %s: %s", devicePath, err.Error())
+		return nil, fmt.Errorf("can't determine real path of %s: %s", devicePath, err.Error())
 	}
 	subSystemPath, err := filepath.EvalSymlinks(filepath.Join(realDevicePath, "subsystem"))
 	if err != nil {
-		return nil, fmt.Errorf("Can't determine real path of %s: %s", filepath.Join(realDevicePath, "subsystem"), err.Error())
+		return nil, fmt.Errorf("can't determine real path of %s: %s", filepath.Join(realDevicePath, "subsystem"), err.Error())
 	}
 	subSystem := filepath.Base(subSystemPath)
 

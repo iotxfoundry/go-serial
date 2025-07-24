@@ -1,10 +1,10 @@
 module go.bug.st/serial
 
-go 1.22
+go 1.24.4
 
 require (
-	github.com/stretchr/testify v1.8.4
-	golang.org/x/sys v0.22.0
+	github.com/stretchr/testify v1.10.0
+	golang.org/x/sys v0.34.0
 )
 
 require (
