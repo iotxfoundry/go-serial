@@ -14,8 +14,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 )
@@ -41,25 +43,38 @@ func startSocatAndWaitForPort(t *testing.T, ctx context.Context) *exec.Cmd {
 }
 
 // startSocatDualPty creates a pair of connected pseudo-terminals and waits
-// until both links are ready. The port under test is opened on portPath,
-// the peer endpoint on peerPath can be opened as a regular file.
-func startSocatDualPty(t *testing.T, ctx context.Context, portPath, peerPath string) *exec.Cmd {
+// until both links are ready. The port under test is opened on the first
+// returned path, the peer endpoint on the second one can be opened as a
+// regular file. Paths are unique per test to avoid collisions between
+// concurrent runs.
+func startSocatDualPty(t *testing.T, ctx context.Context) (*exec.Cmd, string, string) {
 	t.Helper()
+	portPath := "/tmp/faketty-" + t.Name()
+	peerPath := "/tmp/peertty-" + t.Name()
+	os.Remove(portPath)
+	os.Remove(peerPath)
 	cmd := exec.CommandContext(ctx, "socat", "-D",
 		"pty,link="+portPath+",raw,echo=0",
 		"pty,link="+peerPath+",raw,echo=0")
-	r, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	buf := make([]byte, 1024)
-	if _, err = r.Read(buf); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// Wait until both links actually exist: a single read on socat stderr
+	// may return before both symlinks have been created.
+	deadline := time.Now().Add(5 * time.Second)
+	for _, path := range []string{portPath, peerPath} {
+		for {
+			if _, err := os.Stat(path); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				cmd.Process.Kill()
+				t.Fatalf("timeout waiting for %s to appear", path)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
-	return cmd
+	return cmd, portPath, peerPath
 }
 
 func TestSerialReadAndCloseConcurrency(t *testing.T) {
@@ -104,16 +119,16 @@ func TestDoubleCloseIsNoop(t *testing.T) {
 func TestIoCopyFullBuffer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := startSocatDualPty(t, ctx, "/tmp/faketty", "/tmp/peertty")
+	cmd, portPath, peerPath := startSocatDualPty(t, ctx)
 	go cmd.Wait()
 
-	port, err := Open("/tmp/faketty", &Mode{})
+	port, err := Open(portPath, &Mode{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	defer port.Close()
 
-	peer, err := os.OpenFile("/tmp/peertty", os.O_RDWR, 0)
+	peer, err := os.OpenFile(peerPath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -158,17 +173,17 @@ func TestIoCopyFullBuffer(t *testing.T) {
 func TestWriteTimeoutShortWriteReturnsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := startSocatDualPty(t, ctx, "/tmp/faketty", "/tmp/peertty")
+	cmd, portPath, peerPath := startSocatDualPty(t, ctx)
 	go cmd.Wait()
 
-	port, err := Open("/tmp/faketty", &Mode{})
+	port, err := Open(portPath, &Mode{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	defer port.Close()
 
 	// Open the peer but never read from it, so the tty buffer fills up.
-	peer, err := os.OpenFile("/tmp/peertty", os.O_RDWR, 0)
+	peer, err := os.OpenFile(peerPath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -198,10 +213,10 @@ func TestWriteTimeoutShortWriteReturnsError(t *testing.T) {
 func TestReadEmptyBuffer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := startSocatDualPty(t, ctx, "/tmp/faketty", "/tmp/peertty")
+	cmd, portPath, _ := startSocatDualPty(t, ctx)
 	go cmd.Wait()
 
-	port, err := Open("/tmp/faketty", &Mode{})
+	port, err := Open(portPath, &Mode{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -248,10 +263,10 @@ func TestWriteAndCloseConcurrency(t *testing.T) {
 	// the correct multitasking behaviour is happening.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := startSocatDualPty(t, ctx, "/tmp/faketty", "/tmp/peertty")
+	cmd, portPath, _ := startSocatDualPty(t, ctx)
 	go cmd.Wait()
 
-	port, err := Open("/tmp/faketty", &Mode{})
+	port, err := Open(portPath, &Mode{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -266,9 +281,81 @@ func TestWriteAndCloseConcurrency(t *testing.T) {
 	port.Close()
 
 	select {
-	case <-done:
-		// Write must return with any error once the port is closed.
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error from the blocked Write after Close")
+		}
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("expected PortError{PortClosed}, got %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Write did not return after Close")
 	}
+}
+
+func TestSetTimeoutConcurrentWithReadWrite(t *testing.T) {
+	// Regression test for the data race between SetReadTimeout/
+	// SetWriteTimeout and the timeout fields read by Read/Write.
+	// This test is only meaningful when run with the race detector.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd, portPath, peerPath := startSocatDualPty(t, ctx)
+	go cmd.Wait()
+
+	port, err := Open(portPath, &Mode{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer port.Close()
+
+	peer, err := os.OpenFile(peerPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer peer.Close()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := peer.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Initialize the timeouts before starting: a Read that snapshots
+	// NoTimeout blocks until data arrives and is not woken up by a later
+	// SetReadTimeout (net.Conn-like deadline updates are not supported).
+	if err := port.SetReadTimeout(time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := port.SetWriteTimeout(time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			port.SetReadTimeout(time.Duration(rand.Intn(5)+1) * time.Millisecond)
+			port.SetWriteTimeout(time.Duration(rand.Intn(5)+1) * time.Millisecond)
+		}
+	}()
+
+	buf := make([]byte, 64)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		port.Read(buf)          // returns on timeout
+		port.Write([]byte("x")) // peer drains it
+	}
+	close(stop)
+	wg.Wait()
 }

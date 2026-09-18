@@ -25,9 +25,15 @@ type unixPort struct {
 
 	readTimeout  time.Duration
 	writeTimeout time.Duration
-	closeLock    sync.RWMutex
-	closeSignal  *unixutils.Pipe
-	opened       uint32
+	// timeoutMu protects readTimeout and writeTimeout from concurrent
+	// access between Set*Timeout and Read/Write. It must not be the same
+	// lock as closeLock, otherwise Set*Timeout would block behind a Read
+	// held in select for the whole timeout.
+	timeoutMu sync.Mutex
+
+	closeLock   sync.RWMutex
+	closeSignal *unixutils.Pipe
+	opened      uint32
 }
 
 func (port *unixPort) Close() error {
@@ -35,26 +41,30 @@ func (port *unixPort) Close() error {
 		return nil
 	}
 
-	// Close port
 	port.releaseExclusiveAccess()
-	if err := unix.Close(port.handle); err != nil {
-		return err
-	}
 
 	if port.closeSignal != nil {
-		// Send close signal to all pending reads (if any)
+		// Send close signal to all pending Read/Write (if any)
 		port.closeSignal.Write([]byte{0})
 
-		// Wait for all readers to complete
+		// Wait for all pending Read/Write to complete. This cannot
+		// deadlock because the port is in non-blocking mode: Read/Write
+		// sleep in select(2), which the signal above wakes up, they never
+		// sleep inside a read/write syscall.
 		port.closeLock.Lock()
 		defer port.closeLock.Unlock()
 
-		// Close signaling pipe
-		if err := port.closeSignal.Close(); err != nil {
+		// No syscall can be in flight on the handle anymore: close it now
+		// so the descriptor number cannot be reused while Read/Write are
+		// still running. Also close the signaling pipe even if closing
+		// the handle fails, so blocked operations are always woken up.
+		if err := unix.Close(port.handle); err != nil {
+			port.closeSignal.Close()
 			return err
 		}
+		return port.closeSignal.Close()
 	}
-	return nil
+	return unix.Close(port.handle)
 }
 
 func (port *unixPort) Read(p []byte) (int, error) {
@@ -67,15 +77,19 @@ func (port *unixPort) Read(p []byte) (int, error) {
 		return 0, &PortError{code: PortClosed}
 	}
 
+	port.timeoutMu.Lock()
+	readTimeout := port.readTimeout
+	port.timeoutMu.Unlock()
+
 	var deadline time.Time
-	if port.readTimeout != NoTimeout {
-		deadline = time.Now().Add(port.readTimeout)
+	if readTimeout != NoTimeout {
+		deadline = time.Now().Add(readTimeout)
 	}
 
 	fds := unixutils.NewFDSet(port.handle, port.closeSignal.ReadFD())
 	for {
 		timeout := time.Duration(-1)
-		if port.readTimeout != NoTimeout {
+		if readTimeout != NoTimeout {
 			timeout = time.Until(deadline)
 			if timeout < 0 {
 				// a negative timeout means "no-timeout" in Select(...)
@@ -117,7 +131,7 @@ func (port *unixPort) Read(p []byte) (int, error) {
 	}
 }
 
-func (port *unixPort) Write(p []byte) (n int, err error) {
+func (port *unixPort) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -127,14 +141,26 @@ func (port *unixPort) Write(p []byte) (n int, err error) {
 		return 0, &PortError{code: PortClosed}
 	}
 
+	port.timeoutMu.Lock()
+	writeTimeout := port.writeTimeout
+	port.timeoutMu.Unlock()
+
 	// The write timeout is an overall deadline for the whole Write call
 	// (net.Conn-like semantics), so it is tracked across the loop below
 	// where the buffer may be written in multiple chunks.
 	var deadline time.Time
-	if port.writeTimeout != NoTimeout {
-		deadline = time.Now().Add(port.writeTimeout)
+	if writeTimeout != NoTimeout {
+		deadline = time.Now().Add(writeTimeout)
 	}
 
+	// Wait for the port to become writable or for the close signal.
+	// The read end of the close signal pipe is watched for readiness:
+	// Close() writes one byte into the pipe to wake up this select and
+	// report the port as closed. The pipe write end must NOT be put in
+	// the write set since an empty pipe is always writable and would
+	// prevent the select from blocking at all.
+	rfds := unixutils.NewFDSet(port.closeSignal.ReadFD())
+	wfds := unixutils.NewFDSet(port.handle)
 	total := 0
 	for total < len(p) {
 		timeout := time.Duration(-1)
@@ -145,14 +171,6 @@ func (port *unixPort) Write(p []byte) (n int, err error) {
 				timeout = 0
 			}
 		}
-		// Wait for the port to become writable or for the close signal.
-		// The read end of the close signal pipe is watched for readiness:
-		// Close() writes one byte into the pipe to wake up this select and
-		// report the port as closed. The pipe write end must NOT be put in
-		// the write set since an empty pipe is always writable and would
-		// prevent the select from blocking at all.
-		rfds := unixutils.NewFDSet(port.closeSignal.ReadFD())
-		wfds := unixutils.NewFDSet(port.handle)
 		res, err := unixutils.Select(rfds, wfds, wfds, timeout)
 		if err == unix.EINTR {
 			continue
@@ -161,6 +179,11 @@ func (port *unixPort) Write(p []byte) (n int, err error) {
 			return total, err
 		}
 		if res.IsReadable(port.closeSignal.ReadFD()) {
+			return total, &PortError{code: PortClosed}
+		}
+		if res.IsError(port.handle) {
+			// The port reported an exceptional condition (e.g. it has
+			// been disconnected)
 			return total, &PortError{code: PortClosed}
 		}
 		if !res.IsWritable(port.handle) {
@@ -269,7 +292,9 @@ func (port *unixPort) SetReadTimeout(timeout time.Duration) error {
 	if timeout < 0 && timeout != NoTimeout {
 		return &PortError{code: InvalidTimeoutValue}
 	}
+	port.timeoutMu.Lock()
 	port.readTimeout = timeout
+	port.timeoutMu.Unlock()
 	return nil
 }
 
@@ -277,7 +302,9 @@ func (port *unixPort) SetWriteTimeout(timeout time.Duration) error {
 	if timeout < 0 && timeout != NoTimeout {
 		return &PortError{code: InvalidTimeoutValue}
 	}
+	port.timeoutMu.Lock()
 	port.writeTimeout = timeout
+	port.timeoutMu.Unlock()
 	return nil
 }
 

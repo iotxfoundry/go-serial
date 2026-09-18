@@ -89,10 +89,22 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 	}
 	defer windows.CloseHandle(ev.HEvent)
 
+	// Snapshot the handle under the lock: Close sets it to zero, reading
+	// the field without synchronization would be a data race. If the port
+	// has already been closed return immediately. A Close racing with an
+	// in-flight ReadFile aborts the operation and the loop below reports
+	// ERROR_OPERATION_ABORTED (i.e. PortClosed).
+	port.mu.Lock()
+	handle := port.handle
+	port.mu.Unlock()
+	if handle == 0 {
+		return 0, &PortError{code: PortClosed}
+	}
+
 	for {
-		err = windows.ReadFile(port.handle, p, &readed, ev)
+		err = windows.ReadFile(handle, p, &readed, ev)
 		if err == windows.ERROR_IO_PENDING {
-			err = windows.GetOverlappedResult(port.handle, ev, &readed, true)
+			err = windows.GetOverlappedResult(handle, ev, &readed, true)
 		}
 		switch err {
 		case nil:
@@ -126,10 +138,15 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 	// The write timeout is an overall deadline for the whole Write call
 	// (net.Conn-like semantics). CommTimeouts.WriteTotalTimeoutConstant
 	// caps each individual WriteFile chunk, the loop below enforces the
-	// deadline on the whole operation.
+	// deadline on the whole operation. The handle is snapshotted under
+	// the lock for the same reasons as in Read.
 	port.mu.Lock()
+	handle := port.handle
 	writeTimeout := port.writeTimeout
 	port.mu.Unlock()
+	if handle == 0 {
+		return 0, &PortError{code: PortClosed}
+	}
 	var deadline time.Time
 	if writeTimeout != NoTimeout {
 		deadline = time.Now().Add(writeTimeout)
@@ -147,10 +164,10 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 		// same event handle.
 		ev := &windows.Overlapped{HEvent: h}
 		var writed uint32
-		err = windows.WriteFile(port.handle, p[total:], &writed, ev)
+		err = windows.WriteFile(handle, p[total:], &writed, ev)
 		if err == windows.ERROR_IO_PENDING {
 			// wait for write to complete
-			err = windows.GetOverlappedResult(port.handle, ev, &writed, true)
+			err = windows.GetOverlappedResult(handle, ev, &writed, true)
 		}
 		switch err {
 		case nil:
