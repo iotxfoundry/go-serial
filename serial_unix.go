@@ -58,6 +58,9 @@ func (port *unixPort) Close() error {
 }
 
 func (port *unixPort) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	port.closeLock.RLock()
 	defer port.closeLock.RUnlock()
 	if atomic.LoadUint32(&port.opened) != 1 {
@@ -97,6 +100,10 @@ func (port *unixPort) Read(p []byte) (int, error) {
 		if err == unix.EINTR {
 			continue
 		}
+		if err == unix.EAGAIN {
+			// Spurious readability notification on the non-blocking port
+			continue
+		}
 		// Linux: when the port is disconnected during a read operation
 		// the port is left in a "readable with zero-length-data" state.
 		// https://stackoverflow.com/a/34945814/1655275
@@ -111,50 +118,78 @@ func (port *unixPort) Read(p []byte) (int, error) {
 }
 
 func (port *unixPort) Write(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if atomic.LoadUint32(&port.opened) != 1 {
+		return 0, &PortError{code: PortClosed}
+	}
+
+	// The write timeout is an overall deadline for the whole Write call
+	// (net.Conn-like semantics), so it is tracked across the loop below
+	// where the buffer may be written in multiple chunks.
 	var deadline time.Time
 	if port.writeTimeout != NoTimeout {
 		deadline = time.Now().Add(port.writeTimeout)
 	}
 
-	fds := unixutils.NewFDSet(port.handle, port.closeSignal.WriteFD())
-	for {
+	total := 0
+	for total < len(p) {
 		timeout := time.Duration(-1)
-		if port.writeTimeout != NoTimeout {
+		if !deadline.IsZero() {
 			timeout = time.Until(deadline)
 			if timeout < 0 {
 				// a negative timeout means "no-timeout" in Select(...)
 				timeout = 0
 			}
 		}
-		res, err := unixutils.Select(nil, fds, fds, timeout)
+		// Wait for the port to become writable or for the close signal.
+		// The read end of the close signal pipe is watched for readiness:
+		// Close() writes one byte into the pipe to wake up this select and
+		// report the port as closed. The pipe write end must NOT be put in
+		// the write set since an empty pipe is always writable and would
+		// prevent the select from blocking at all.
+		rfds := unixutils.NewFDSet(port.closeSignal.ReadFD())
+		wfds := unixutils.NewFDSet(port.handle)
+		res, err := unixutils.Select(rfds, wfds, wfds, timeout)
 		if err == unix.EINTR {
 			continue
 		}
 		if err != nil {
-			return 0, err
+			return total, err
 		}
-		if !res.IsWritable(port.closeSignal.WriteFD()) {
-			return 0, &PortError{code: PortClosed}
+		if res.IsReadable(port.closeSignal.ReadFD()) {
+			return total, &PortError{code: PortClosed}
 		}
 		if !res.IsWritable(port.handle) {
 			// Timeout happened
-			return 0, os.ErrDeadlineExceeded
+			return total, os.ErrDeadlineExceeded
 		}
-		n, err = unix.Write(port.handle, p)
+		n, err := unix.Write(port.handle, p[total:])
 		if err == unix.EINTR {
 			continue
 		}
-		// Linux: when the port is disconnected during a read operation
-		// the port is left in a "readable with zero-length-data" state.
-		// https://stackoverflow.com/a/34945814/1655275
-		if n == 0 && err == nil {
-			return 0, &PortError{code: PortClosed}
+		if err == unix.EAGAIN {
+			// Not enough space in the port buffer: wait for writability.
+			continue
 		}
 		if n < 0 { // Do not return -1 unix errors
 			n = 0
 		}
-		return n, err
+		total += n
+		// Linux: when the port is disconnected during a read operation
+		// the port is left in a "readable with zero-length-data" state.
+		// https://stackoverflow.com/a/34945814/1655275
+		if n == 0 && err == nil {
+			return total, &PortError{code: PortClosed}
+		}
+		if err != nil {
+			return total, err
+		}
 	}
+	return total, nil
 }
 
 func (port *unixPort) Break(t time.Duration) error {
@@ -324,7 +359,14 @@ func nativeOpen(portName string, mode *Mode) (*unixPort, error) {
 		return nil, &PortError{code: InvalidSerialPort, causedBy: fmt.Errorf("error configuring port: %w", err)}
 	}
 
-	unix.SetNonblock(h, false)
+	// Keep the port in non-blocking mode: reads and writes are gated by
+	// the select(2) loops in Read/Write. This is required to give the
+	// write timeout a chance to trigger: with a blocking file descriptor
+	// a write(2) to a serial port whose buffer is full would sleep inside
+	// the kernel until the whole buffer can be transferred, ignoring any
+	// deadline. unix.Write then returns EAGAIN when the buffer is full
+	// and the select loop below waits for writability instead.
+	unix.SetNonblock(h, true)
 
 	port.acquireExclusiveAccess()
 

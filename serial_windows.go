@@ -30,9 +30,10 @@ import (
 )
 
 type windowsPort struct {
-	mu         sync.Mutex
-	handle     windows.Handle
-	hasTimeout bool
+	mu           sync.Mutex
+	handle       windows.Handle
+	hasTimeout   bool
+	writeTimeout time.Duration
 }
 
 func nativeGetPortsList() ([]string, error) {
@@ -78,6 +79,9 @@ func (port *windowsPort) Close() error {
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	var readed uint32
 	ev, err := createOverlappedEvent()
 	if err != nil {
@@ -115,18 +119,63 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 }
 
 func (port *windowsPort) Write(p []byte) (int, error) {
-	var writed uint32
-	ev, err := createOverlappedEvent()
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// The write timeout is an overall deadline for the whole Write call
+	// (net.Conn-like semantics). CommTimeouts.WriteTotalTimeoutConstant
+	// caps each individual WriteFile chunk, the loop below enforces the
+	// deadline on the whole operation.
+	port.mu.Lock()
+	writeTimeout := port.writeTimeout
+	port.mu.Unlock()
+	var deadline time.Time
+	if writeTimeout != NoTimeout {
+		deadline = time.Now().Add(writeTimeout)
+	}
+
+	h, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
 		return 0, err
 	}
-	defer windows.CloseHandle(ev.HEvent)
-	err = windows.WriteFile(port.handle, p, &writed, ev)
-	if err == windows.ERROR_IO_PENDING {
-		// wait for write to complete
-		err = windows.GetOverlappedResult(port.handle, ev, &writed, true)
+	defer windows.CloseHandle(h)
+
+	total := 0
+	for total < len(p) {
+		// Use a fresh OVERLAPPED structure for every chunk, reusing the
+		// same event handle.
+		ev := &windows.Overlapped{HEvent: h}
+		var writed uint32
+		err = windows.WriteFile(port.handle, p[total:], &writed, ev)
+		if err == windows.ERROR_IO_PENDING {
+			// wait for write to complete
+			err = windows.GetOverlappedResult(port.handle, ev, &writed, true)
+		}
+		switch err {
+		case nil:
+			// operation completed successfully
+		case windows.ERROR_OPERATION_ABORTED:
+			// port may have been closed
+			return total, &PortError{code: PortClosed, causedBy: err}
+		default:
+			// error happened
+			return total, &PortError{causedBy: err}
+		}
+		total += int(writed)
+		if writed == 0 {
+			// No progress: either the write timeout expired or the port
+			// is gone. io.Writer requires a non-nil error if n < len(p).
+			if !deadline.IsZero() && !time.Now().Before(deadline) {
+				return total, os.ErrDeadlineExceeded
+			}
+			return total, &PortError{code: InvalidSerialPort}
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return total, os.ErrDeadlineExceeded
+		}
 	}
-	return int(writed), err
+	return total, nil
 }
 
 func (port *windowsPort) Drain() (err error) {
@@ -377,6 +426,10 @@ func (port *windowsPort) SetWriteTimeout(timeout time.Duration) error {
 	if err := windows.SetCommTimeouts(port.handle, commTimeouts); err != nil {
 		return &PortError{code: InvalidTimeoutValue, causedBy: err}
 	}
+
+	port.mu.Lock()
+	port.writeTimeout = timeout
+	port.mu.Unlock()
 
 	return nil
 }

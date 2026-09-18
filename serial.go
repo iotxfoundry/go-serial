@@ -6,23 +6,29 @@
 
 package serial
 
-import "time"
+import (
+	"io"
+	"time"
+)
 
-// Port is the interface for a serial Port
+// Port is the interface for a serial Port.
+//
+// Port embeds io.ReadWriteCloser, so a Port fully complies with the
+// io.Reader, io.Writer and io.Closer contracts and can be safely used
+// with io.Copy, bufio and the other standard io helpers:
+//
+//   - Read blocks until at least one byte is received and returns
+//     (0, os.ErrDeadlineExceeded) when the read timeout (see
+//     SetReadTimeout) expires.
+//   - Write writes the whole buffer, or returns a non-nil error if
+//     less than len(p) bytes were written; the write timeout (see
+//     SetWriteTimeout) is a deadline applied to the whole call, upon
+//     expiry it returns (n, os.ErrDeadlineExceeded) with n < len(p).
 type Port interface {
+	io.ReadWriteCloser
+
 	// SetMode sets all parameters of the serial port
 	SetMode(mode *Mode) error
-
-	// Stores data received from the serial port into the provided byte array
-	// buffer. The function returns the number of bytes read.
-	//
-	// The Read function blocks until (at least) one byte is received from
-	// the serial port or an error occurs.
-	Read(p []byte) (n int, err error)
-
-	// Send the content of the data byte array to the serial port.
-	// Returns the number of bytes written.
-	Write(p []byte) (n int, err error)
 
 	// Wait until all data in the buffer are sent
 	Drain() error
@@ -50,9 +56,6 @@ type Port interface {
 	// SetWriteTimeout sets the timeout for the Write operation or use serial.NoTimeout
 	// to disable write timeout.
 	SetWriteTimeout(timeout time.Duration) error
-
-	// Close the serial port
-	Close() error
 
 	// Break sends a break for a determined time
 	Break(time.Duration) error
@@ -207,6 +210,12 @@ func (e PortError) Error() string {
 		return e.EncodedErrorString() + ": " + e.causedBy.Error()
 	}
 	return e.EncodedErrorString()
+}
+
+// Unwrap returns the error that caused the PortError, if any, so that
+// errors.Is and errors.As can be used to inspect the underlying cause.
+func (e PortError) Unwrap() error {
+	return e.causedBy
 }
 
 // Code returns an identifier for the kind of error occurred
