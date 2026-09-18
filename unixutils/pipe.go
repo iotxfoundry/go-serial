@@ -1,5 +1,5 @@
 //
-// Copyright 2014-2024 Cristian Maglie. All rights reserved.
+// Copyright 2014-2026 Cristian Maglie. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 //
@@ -21,16 +21,17 @@ type Pipe struct {
 	wr     int
 }
 
-// Open creates a new pipe
-func (p *Pipe) Open() error {
+// NewPipe creates a new pipe
+func NewPipe() (*Pipe, error) {
 	fds := []int{0, 0}
 	if err := unix.Pipe(fds); err != nil {
-		return err
+		return nil, err
 	}
-	p.rd = fds[0]
-	p.wr = fds[1]
-	p.opened = true
-	return nil
+	return &Pipe{
+		rd:     fds[0],
+		wr:     fds[1],
+		opened: true,
+	}, nil
 }
 
 // ReadFD returns the file handle for the read side of the pipe.

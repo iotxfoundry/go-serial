@@ -1,5 +1,5 @@
 //
-// Copyright 2014-2024 Cristian Maglie. All rights reserved.
+// Copyright 2014-2026 Cristian Maglie. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 //
@@ -329,12 +329,12 @@ func nativeOpen(portName string, mode *Mode) (*unixPort, error) {
 	port.acquireExclusiveAccess()
 
 	// This pipe is used as a signal to cancel blocking Read
-	pipe := &unixutils.Pipe{}
-	if err := pipe.Open(); err != nil {
+	if pipe, err := unixutils.NewPipe(); err != nil {
 		port.Close()
 		return nil, &PortError{code: InvalidSerialPort, causedBy: fmt.Errorf("error opening signaling pipe: %w", err)}
+	} else {
+		port.closeSignal = pipe
 	}
-	port.closeSignal = pipe
 
 	return port, nil
 }
